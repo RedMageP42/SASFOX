@@ -1,0 +1,441 @@
+#!/usr/bin/env python
+
+"""
+Script to process SAXS data in batch mode, compute scattering properties, and extract correlation lengths using various models.
+
+Usage:
+    python script.py -i <input_files> [-hl <header_lines>] [-u <units>] [-f <factor>] [-qmin <qmin>] [-qmax <qmax>] [-bg <background_file>]
+
+Arguments:
+    -i, --input         Input data file paths (required, space-separated for multiple files).
+    -hl, --header_lines Number of header lines to skip in the data file (default: 0).
+    -u, --units         Units for q values: 'A' for 1/Å or 'nm' for 1/nm (default: 'A').
+    -f, --factor        Normalization factor for intensity values (default: 1.0).
+    -qmin               Minimum q value for analysis (optional; skips interactive selection if provided).
+    -qmax               Maximum q value for analysis (optional; skips interactive selection if provided).
+    -bg                 Background file path for intensity subtraction (optional).
+
+Output:
+    Results are saved in text files within a directory named as:
+        - YYYYMMDD_SAXSanalysis_X (e.g., 20250105_SAXSanalysis_0)
+      where X is a progressive number starting at 0. If the folder exists, X is incremented.
+    
+    Fitting quality plots are saved as PNG files with the format:
+        - X_METHOD.png, where X is the base name of the input file, and METHOD is either OZ or DB.
+    Results for all input files are saved in a single `results.txt` file in the output directory.
+    Additionally, residual files are written for each fit:
+        - <basename>_OZ_residuals.tsv
+        - <basename>_DB_residuals.tsv
+        - <basename>_Guinier_residuals.tsv (power-law over user-selected range)
+"""
+
+import numpy as np
+import pandas as pd
+import argparse
+from scipy.integrate import trapz
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FixedLocator, LogLocator, NullFormatter, FormatStrFormatter
+import os
+from datetime import datetime
+
+def compute_metrics(y_obs, y_fit, k):
+    y_obs = np.asarray(y_obs, dtype=float)
+    y_fit = np.asarray(y_fit, dtype=float)
+    n = y_obs.size
+    dof = max(n - k, 0)
+    resid = y_obs - y_fit
+    RSS = float(np.sum(resid**2))
+    TSS = float(np.sum((y_obs - np.mean(y_obs))**2))
+    R2 = np.nan if TSS == 0.0 else 1.0 - RSS / TSS
+    R2adj = np.nan
+    if TSS > 0.0 and n > (k + 1):
+        R2adj = 1.0 - (RSS / max(n - k, 1)) / (TSS / (n - 1))
+    RMSE = np.sqrt(RSS / max(dof, 1)) if dof > 0 else np.nan
+    chi2red = np.nan
+    if n > 0 and RSS > 0:
+        AIC = n * np.log(RSS / n) + 2 * k
+        BIC = n * np.log(RSS / n) + k * np.log(n)
+    else:
+        AIC, BIC = np.nan, np.nan
+    return dict(n=n, k=k, dof=dof, RSS=RSS, TSS=TSS, R2=R2, R2adj=R2adj, RMSE=RMSE, chi2red=chi2red, AIC=AIC, BIC=BIC, residuals=resid)
+
+def write_residuals(path, q, I_obs, I_fit, residuals):
+    q = np.asarray(q)
+    I_obs = np.asarray(I_obs)
+    I_fit = np.asarray(I_fit)
+    residuals = np.asarray(residuals)
+    std_res = np.full_like(residuals, np.nan, dtype=float)
+    header = "q\tI_obs\tI_fit\tresidual\tstd_residual"
+    arr = np.column_stack([q, I_obs, I_fit, residuals, std_res])
+    np.savetxt(path, arr, header=header, fmt="%.8g", delimiter="\t", comments='')
+
+def compute_invariant(q, Iq, qmin, qmax):
+    mask = (q >= qmin) & (q <= qmax)
+    return trapz(Iq[mask] * q[mask] ** 2, q[mask])
+
+def compute_integrated_intensity(q, Iq, qmin, qmax):
+    mask = (q >= qmin) & (q <= qmax)
+    return trapz(q[mask] * Iq[mask], q[mask])
+
+def ornstein_zernike_fit(q, Iq, qmin, qmax, file_name, output_dir):
+    mask = (q >= qmin) & (q <= qmax)
+    q_fit = q[mask]
+    Iq_fit = Iq[mask]
+
+    def oz_model(q, I0, xi):
+        return I0 / (1 + (q * xi) ** 2)
+
+    try:
+        # ---- OZ fit ----
+        initial_guess = [np.max(Iq_fit), 1.0]
+        bounds = ([0, 0], [np.inf, np.inf])
+        popt, pcov = curve_fit(oz_model, q_fit, Iq_fit, p0=initial_guess, bounds=bounds)
+        I0, xi = popt
+        y_hat = oz_model(q_fit, *popt)  # OZ prediction
+        metrics = compute_metrics(Iq_fit, y_hat, k=2)
+
+        if pcov is not None and np.all(np.isfinite(pcov)):
+            perr = np.sqrt(np.diag(pcov))
+            I0_se, xi_se = float(perr[0]), float(perr[1])
+        else:
+            I0_se, xi_se = np.nan, np.nan
+
+        # ---- Main OZ fit plot (unchanged) ----
+        plt.figure()
+        plt.plot(q_fit, Iq_fit, 'bo', label="Data")
+        plt.plot(q_fit, y_hat, 'r-', label=f"Fit: ξ={xi:.4f}")
+        plt.xlabel("q")
+        plt.ylabel("Intensity")
+        plt.title(f"OZ Fit for {os.path.basename(file_name)}")
+        plt.legend()
+        plt.xscale('log'); plt.yscale('log')
+        plot_path = os.path.join(output_dir, f"{os.path.basename(file_name).split('.')[0]}_OZ.png")
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
+
+        # ---- Residuals TSV (OZ) ----
+        res_path = os.path.join(output_dir, f"{os.path.basename(file_name).split('.')[0]}_OZ_residuals.tsv")
+        write_residuals(res_path, q_fit, Iq_fit, y_hat, metrics["residuals"])
+
+        # ---- OZ residuals plot — PNG only, fixed axes ----
+        YMIN, YMAX = -0.001, 0.001
+        XMIN, XMAX = float(qmin), float(qmax)
+
+        fig_res, ax_res = plt.subplots(figsize=(4.5, 3.0))
+        ax_res.set_xscale('log')
+        ax_res.set_yscale('linear')
+        ax_res.plot(q_fit, metrics["residuals"], marker='o', linestyle='none', ms=3, label="Residuals (OZ)")
+        ax_res.axhline(0.0, linewidth=1)
+        ax_res.set_xlabel("q")
+        ax_res.set_ylabel("Residuals (I_obs − I_fit)")
+        ax_res.set_title("OZ residuals")
+        ax_res.grid(True, which="both", linewidth=0.5, linestyle="--", alpha=0.6)
+
+        # Show a couple of quick metrics
+        try:
+            r2 = metrics.get("R2", float("nan"))
+            rmse = metrics.get("RMSE", float("nan"))
+            ax_res.text(0.02, 0.95, f"$R^2$={r2:.4f}, RMSE={rmse:.3g}",
+                        transform=ax_res.transAxes, va="top", ha="left")
+        except Exception:
+            pass
+
+        # Lock limits AFTER layout
+        fig_res.tight_layout()
+        ax_res.set_xlim(XMIN, XMAX)
+        ax_res.set_ylim(YMIN, YMAX)
+        ax_res.set_autoscaley_on(False)
+        fig_res.canvas.draw()
+
+        base = os.path.join(output_dir, f"{os.path.basename(file_name).split('.')[0]}_OZ_residuals")
+        fig_res.savefig(base + ".png", dpi=600)
+        plt.close(fig_res)
+
+        return I0, xi, I0_se, xi_se, metrics
+
+    except RuntimeError:
+        print(f"Ornstein-Zernike fit failed for {file_name}.")
+        return np.nan, np.nan, np.nan, np.nan, {
+            k: np.nan for k in ["n","k","dof","RSS","TSS","R2","R2adj","RMSE","chi2red","AIC","BIC","residuals"]
+        }
+
+def debye_bueche_fit(q, Iq, qmin, qmax, file_name, output_dir):
+    mask = (q >= qmin) & (q <= qmax)
+    q_fit = q[mask]
+    Iq_fit = Iq[mask]
+
+    def db_model(q, I0, xi):
+        return I0 / (1 + (q * xi) ** 2) ** 2
+
+    try:
+        initial_guess = [np.max(Iq_fit), 1.0]
+        bounds = ([0, 0], [np.inf, np.inf])
+        popt, pcov = curve_fit(db_model, q_fit, Iq_fit, p0=initial_guess, bounds=bounds)
+        I0, xi = popt
+        y_hat = db_model(q_fit, *popt)
+        metrics = compute_metrics(Iq_fit, y_hat, k=2)
+
+        if pcov is not None and np.all(np.isfinite(pcov)):
+            perr = np.sqrt(np.diag(pcov))
+            I0_se, xi_se = float(perr[0]), float(perr[1])
+        else:
+            I0_se, xi_se = np.nan, np.nan
+
+        # DB fit plot (as before)
+        plt.figure()
+        plt.plot(q_fit, Iq_fit, 'bo', label="Data")
+        plt.plot(q_fit, y_hat, 'g-', label=f"Fit: ξ={xi:.4f}")
+        plt.xlabel("q")
+        plt.ylabel("Intensity")
+        plt.title(f"DB Fit for {os.path.basename(file_name)}")
+        plt.legend()
+        plt.xscale('log'); plt.yscale('log')
+        plot_path = os.path.join(output_dir, f"{os.path.basename(file_name).split('.')[0]}_DB.png")
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
+
+        # Write DB residuals TSV ONLY — NO PLOT
+        res_path = os.path.join(output_dir, f"{os.path.basename(file_name).split('.')[0]}_DB_residuals.tsv")
+        write_residuals(res_path, q_fit, Iq_fit, y_hat, metrics["residuals"])
+
+        return I0, xi, I0_se, xi_se, metrics
+
+    except RuntimeError:
+        print(f"Debye-Bueche fit failed for {file_name}.")
+        return np.nan, np.nan, np.nan, np.nan, {
+            k: np.nan for k in ["n","k","dof","RSS","TSS","R2","R2adj","RMSE","chi2red","AIC","BIC","residuals"]
+        }
+
+clicks = []
+
+def on_click(event):
+    global clicks
+    if event.xdata is not None and event.ydata is not None:
+        clicks.append((event.xdata, event.ydata))
+        if len(clicks) >= 2:
+            plt.close()
+
+def find_closest_value(array, value):
+    return array[np.argmin(np.abs(array - value))]
+
+def validate_q_range(q, qmin, qmax):
+    if qmin < np.min(q) or qmax > np.max(q):
+        raise ValueError("qmin and qmax must be within the range of q values.")
+    return qmin, qmax
+
+def subtract_background(q_data, Iq_data, q_bg, Iq_bg, qmin, qmax):
+    corrected_Iq = []
+    mask = (q_data >= qmin) & (q_data <= qmax)
+    q_data = q_data[mask]
+    Iq_data = Iq_data[mask]
+
+    for q_val, Iq_val in zip(q_data, Iq_data):
+        closest_q_bg = find_closest_value(q_bg, q_val)
+        if abs(q_val - closest_q_bg) / q_val > 0.05:
+            raise ValueError(f"Background q value for {q_val} differs by more than 5%.")
+        bg_index = np.argmin(np.abs(q_bg - closest_q_bg))
+        corrected_Iq.append(Iq_val - Iq_bg[bg_index])
+    return np.array(corrected_Iq), q_data
+
+def compute_slope_rg_and_residuals(q_full, Iq_full, file_name, output_dir, conversion_factor):
+    global clicks
+    clicks = []
+
+    plt.figure()
+    plt.plot(q_full, Iq_full, 'bo-', markersize=3, label="Data")
+    plt.xscale('log')
+    plt.yscale('log')
+    plt.xlabel('q')
+    plt.ylabel('Intensity')
+    plt.title(f"Select slope range for {file_name}")
+    plt.legend()
+    plt.gca().set_aspect('equal', adjustable='datalim')
+    plt.grid(True, which="both", ls="--", lw=0.5)
+    plt.gcf().canvas.mpl_connect('button_press_event', on_click)
+    plt.show()
+
+    if len(clicks) != 2:
+        print(f"Error: Exactly two points must be selected for slope calculation on {file_name}.")
+        return np.nan, np.nan, None, None
+
+    (x1, y1), (x2, y2) = sorted(clicks, key=lambda x: x[0])
+    slope = (np.log10(y2) - np.log10(y1)) / (np.log10(x2) - np.log10(x1))
+    Rg = np.sqrt(-3 * slope) * conversion_factor if slope < 0 else np.nan
+
+    mask = (q_full >= x1) & (q_full <= x2)
+    q_sel = q_full[mask]
+    I_sel = Iq_full[mask]
+
+    if q_sel.size < 2:
+        return slope, Rg, None, None
+
+    q_pow = q_sel ** slope
+    denom = np.sum(q_pow ** 2)
+    if denom == 0:
+        return slope, Rg, None, None
+    C = np.sum(q_pow * I_sel) / denom
+    I_fit = C * q_pow
+
+    metrics = compute_metrics(I_sel, I_fit, k=1)
+    res_path = os.path.join(output_dir, f"{os.path.basename(file_name).split('.')[0]}_Guinier_residuals.tsv")
+    write_residuals(res_path, q_sel, I_sel, I_fit, metrics["residuals"])
+
+    return slope, Rg, metrics, dict(C=C, slope=slope, q=q_sel, I_obs=I_sel, I_fit=I_fit)
+
+def create_output_directory(base_name="SAXSanalysis"):
+    today = datetime.now().strftime("%Y%m%d")
+    counter = 0
+    while True:
+        dir_name = f"{today}_{base_name}_{counter}"
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name)
+            return dir_name
+        counter += 1
+
+def main():
+    parser = argparse.ArgumentParser(description="Process scattering data in batch mode.")
+    parser.add_argument('-i', '--input', type=str, nargs='+', required=True, help="Input data file paths.")
+    parser.add_argument('-hl', '--header_lines', type=int, default=0, help="Number of header lines to skip in the data file.")
+    parser.add_argument('-u', '--units', type=str, choices=["A", "nm"], default="A", help="Units for q values: A for 1/Å and nm for 1/nm.")
+    parser.add_argument('-f', '--factor', type=float, default=1.0, help="Normalization factor for intensity values.")
+    parser.add_argument('-qmin', type=float, help="Minimum q value for analysis.")
+    parser.add_argument('-qmax', type=float, help="Maximum q value for analysis.")
+    parser.add_argument('-bg', '--background', type=str, help="Background file path for intensity subtraction.")
+
+    args = parser.parse_args()
+
+    conversion_factor = 10 if args.units == "A" else 1
+
+    output_dir = create_output_directory()
+
+    global clicks
+    clicks = []
+
+    qmin, qmax = None, None
+    q = None
+
+    if args.qmin is None or args.qmax is None:
+        if args.background:
+            bg_data = pd.read_csv(args.background, skiprows=args.header_lines, delim_whitespace=True, usecols=[0, 1], header=None)
+            q_bg = bg_data[0].values * conversion_factor
+            Iq_bg = bg_data[1].values * args.factor
+
+            fig, ax = plt.subplots()
+            ax.plot(q_bg, Iq_bg, '-o', markersize=3)
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            ax.set_xlabel('q')
+            ax.set_ylabel('Intensity')
+            fig.canvas.mpl_connect('button_press_event', on_click)
+            plt.show()
+
+            if len(clicks) != 2:
+                print("Error: Exactly two points must be selected for qmin and qmax.")
+                return
+
+            qmin, qmax = sorted([clicks[0][0], clicks[1][0]])
+            q = q_bg
+        else:
+            first_file = args.input[0]
+            data = pd.read_csv(first_file, skiprows=args.header_lines, delim_whitespace=True, usecols=[0, 1], header=None)
+            q = data[0].values * conversion_factor
+            Iq = data[1].values * args.factor
+
+            fig, ax = plt.subplots()
+            ax.plot(q, Iq, '-o', markersize=3)
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            ax.set_xlabel('q')
+            ax.set_ylabel('Intensity')
+            fig.canvas.mpl_connect('button_press_event', on_click)
+            plt.show()
+
+            if len(clicks) != 2:
+                print("Error: Exactly two points must be selected for qmin and qmax.")
+                return
+
+            qmin, qmax = sorted([clicks[0][0], clicks[1][0]])
+    else:
+        qmin = args.qmin
+        qmax = args.qmax
+
+    if q is not None:
+        qmin, qmax = validate_q_range(q, qmin, qmax)
+
+    if args.background:
+        bg_data = pd.read_csv(args.background, skiprows=args.header_lines, delim_whitespace=True, usecols=[0, 1], header=None)
+        q_bg = bg_data[0].values * conversion_factor
+        Iq_bg = bg_data[1].values * args.factor
+
+    results_file = os.path.join(output_dir, "results.txt")
+    with open(results_file, "w") as f:
+        header_cols = [
+            "File",
+            "Invariant","Integrated Intensity","Correlation Length (No Model)",
+            "OZ Correlation Length","OZ_I0","OZ_I0_se","OZ_xi_se","OZ_n","OZ_k","OZ_dof","OZ_RSS","OZ_TSS","OZ_R2","OZ_R2adj","OZ_RMSE","OZ_chi2red","OZ_AIC","OZ_BIC",
+            "DB Correlation Length","DB_I0","DB_I0_se","DB_xi_se","DB_n","DB_k","DB_dof","DB_RSS","DB_TSS","DB_R2","DB_R2adj","DB_RMSE","DB_chi2red","DB_AIC","DB_BIC",
+            "Slope","Radius_of_Gyration",
+            "Guinier_n","Guinier_k","Guinier_dof","Guinier_RSS","Guinier_TSS","Guinier_R2","Guinier_R2adj","Guinier_RMSE","Guinier_chi2red","Guinier_AIC","Guinier_BIC"
+        ]
+        f.write("\t".join(header_cols) + "\n")
+
+        for file_path in args.input:
+            data = pd.read_csv(file_path, skiprows=args.header_lines, delim_whitespace=True, usecols=[0, 1], header=None)
+            q = data[0].values * conversion_factor
+            Iq = data[1].values * args.factor
+
+            if args.background:
+                Iq, q = subtract_background(q, Iq, q_bg, Iq_bg, qmin, qmax)
+
+            invariant_val = compute_invariant(q, Iq, qmin, qmax)
+            integrated_intensity = compute_integrated_intensity(q, Iq, qmin, qmax)
+            correlation_length_no_model = integrated_intensity / invariant_val if invariant_val != 0 else np.nan
+
+            oz_I0, correlation_length_oz, oz_I0_se, oz_xi_se, oz_metrics = ornstein_zernike_fit(q, Iq, qmin, qmax, file_path, output_dir)
+            db_I0, correlation_length_db, db_I0_se, db_xi_se, db_metrics = debye_bueche_fit(q, Iq, qmin, qmax, file_path, output_dir)
+
+            slope, Rg, guinier_metrics, guinier_detail = compute_slope_rg_and_residuals(
+                data[0].values, data[1].values, file_path, output_dir, conversion_factor
+            )
+
+            row = [
+                os.path.basename(file_path),
+                f"{invariant_val:.6g}", f"{integrated_intensity:.6g}", f"{(correlation_length_no_model if np.isfinite(correlation_length_no_model) else np.nan):.6g}",
+                f"{correlation_length_oz:.6g}", f"{oz_I0:.6g}", f"{oz_I0_se:.6g}", f"{oz_xi_se:.6g}",
+                f"{oz_metrics.get('n', np.nan)}", f"{oz_metrics.get('k', np.nan)}", f"{oz_metrics.get('dof', np.nan)}",
+                f"{oz_metrics.get('RSS', np.nan):.6g}", f"{oz_metrics.get('TSS', np.nan):.6g}", f"{oz_metrics.get('R2', np.nan):.6g}",
+                f"{oz_metrics.get('R2adj', np.nan):.6g}", f"{oz_metrics.get('RMSE', np.nan):.6g}", f"{oz_metrics.get('chi2red', np.nan):.6g}",
+                f"{oz_metrics.get('AIC', np.nan):.6g}", f"{oz_metrics.get('BIC', np.nan):.6g}",
+                f"{correlation_length_db:.6g}", f"{db_I0:.6g}", f"{db_I0_se:.6g}", f"{db_xi_se:.6g}",
+                f"{db_metrics.get('n', np.nan)}", f"{db_metrics.get('k', np.nan)}", f"{db_metrics.get('dof', np.nan)}",
+                f"{db_metrics.get('RSS', np.nan):.6g}", f"{db_metrics.get('TSS', np.nan):.6g}", f"{db_metrics.get('R2', np.nan):.6g}",
+                f"{db_metrics.get('R2adj', np.nan):.6g}", f"{db_metrics.get('RMSE', np.nan):.6g}", f"{db_metrics.get('chi2red', np.nan):.6g}",
+                f"{db_metrics.get('AIC', np.nan):.6g}", f"{db_metrics.get('BIC', np.nan):.6g}",
+                f"{slope:.6g}", f"{Rg:.6g}"
+            ]
+
+            if guinier_metrics is None:
+                row.extend([str(np.nan)]*11)
+            else:
+                row.extend([
+                    f"{guinier_metrics.get('n', np.nan)}", f"{guinier_metrics.get('k', np.nan)}", f"{guinier_metrics.get('dof', np.nan)}",
+                    f"{guinier_metrics.get('RSS', np.nan):.6g}", f"{guinier_metrics.get('TSS', np.nan):.6g}", f"{guinier_metrics.get('R2', np.nan):.6g}",
+                    f"{guinier_metrics.get('R2adj', np.nan):.6g}", f"{guinier_metrics.get('RMSE', np.nan):.6g}", f"{guinier_metrics.get('chi2red', np.nan):.6g}",
+                    f"{guinier_metrics.get('AIC', np.nan):.6g}", f"{guinier_metrics.get('BIC', np.nan):.6g}",
+                ])
+
+            f.write("\t".join(row) + "\n")
+
+            print(f"Processed {file_path}:")
+            print(f"  Invariant: {invariant_val:.6g}")
+            print(f"  Integrated Intensity: {integrated_intensity:.6g}")
+            print(f"  Correlation Length (No Model): {correlation_length_no_model:.6g}")
+            print(f"  OZ Correlation Length: {correlation_length_oz:.6g} | I(0)={oz_I0:.6g} (±{oz_I0_se:.3g}) | ξ_se={oz_xi_se:.3g} | R2={oz_metrics.get('R2', np.nan):.4f} | RMSE={oz_metrics.get('RMSE', np.nan):.4g}")
+            print(f"  DB Correlation Length: {correlation_length_db:.6g} | I(0)={db_I0:.6g} (±{db_I0_se:.3g}) | ξ_se={db_xi_se:.3g} | R2={db_metrics.get('R2', np.nan):.4f} | RMSE={db_metrics.get('RMSE', np.nan):.4g}")
+            print(f"  Slope: {slope:.6g} | Rg: {Rg:.6g}")
+            if guinier_metrics is not None:
+                print(f"  Guinier (power-law over selected range): R2={guinier_metrics.get('R2', np.nan):.4f} | RMSE={guinier_metrics.get('RMSE', np.nan):.4g}")
+
+if __name__ == "__main__":
+    main()
