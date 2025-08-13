@@ -81,4 +81,4 @@ pip install numpy pandas scipy matplotlib
 
 Contact
 Issues or feature requests: please include your command line, a small input example, and the produced results.txt.
-alessandro1.mariani@polimi.it
+alessandro1 DOT mariani AT polimi DOT it
