@@ -1,69 +1,84 @@
 SASFOX: Small-Angle Scattering Fitting and Output eXtractor
 
-Version 1.0 — 20250813
-
 Author: Dr. Alessandro Mariani
 
 Description
-SASFOX.py is a Python script for automated processing, fitting, and analysis of SAXS/SANS data. It can handle one or multiple datasets, apply background subtraction, normalize intensities, fit structural models, and extract key scattering parameters. The workflow is driven entirely by a user-editable config.ini file.
+SASFOX.py processes SAXS/SANS curves in batch, applies optional background subtraction, lets you define the analysis window (qmin–qmax) interactively or by flags, and extracts correlation lengths by (i) model-free integrals, (ii) Ornstein–Zernike (OZ) fitting, and (iii) Debye–Bueche (DB) fitting. It also provides an interactive, user-selected range to estimate a power-law slope and a Guinier-style radius of gyration (Rg), with residuals exported for the selected region. All results and plots are written to a timestamped output folder.
 
-The code is designed for batch mode processing, enabling the rapid and reproducible analysis of multiple scattering curves with minimal manual intervention.
+Key features
+• Batch processing of one or more 2-column data files (q, I)
+• Optional background subtraction from a separate (q_bg, I_bg) file (nearest-q match with 5% tolerance)
+• Units for q: A (Å⁻¹) or nm (nm⁻¹); internally q is converted to nm⁻¹ (Å⁻¹ → ×10)
+• Intensity normalization via a scalar factor (multiplies I)
+• q-range set by flags or by clicking two points on a plot (background curve if provided, otherwise the first input curve)
+• Model-free quantities over [qmin, qmax]:
+– Invariant  Q = ∫ I(q) q² dq
+– Integrated intensity  J = ∫ I(q) q dq
+– “No-model” correlation length  ξ_int = J / Q
+• Model fits over [qmin, qmax]:
+– Ornstein–Zernike:  I(q) = I₀ / [1 + (q ξ)²]
+– Debye–Bueche:      I(q) = I₀ / [1 + (q ξ)²]²
+Both return parameter standard errors and fit metrics (n, k, dof, RSS, TSS, R², R²_adj, RMSE, χ²_red, AIC, BIC).
+• Interactive power-law/Guinier region: pick a range; the code estimates a power-law slope and an Rg, and writes residuals for that region (see “Outputs”).
+• Per-file console summary plus a tab-delimited master table (results.txt).
 
-Main Features
-	•	Reads one or more SAXS/SANS data files in plain text format.
-	•	Supports background subtraction from a separate file or from the data itself.
-	•	Unit handling for q values (Å⁻¹ or nm⁻¹).
-	•	Optional intensity normalization with user-defined scaling factor.
-	•	Automatic cropping of data to user-defined qmin and qmax.
-	•	Fits data using various models (Guinier, Porod, power-law, etc.) depending on configuration.
-	•	Extracts characteristic lengths (e.g., correlation length, radius of gyration).
-	•	Outputs processed data and fitted parameters in CSV format.
-	•	Saves publication-quality plots with fitted curves and residuals.
-	•	Logs all processing steps and potential warnings for traceability.
+Command-line usage
+python SASFOX.py -i  [-hl ] [-u {A,nm}] [-f ] [-qmin ] [-qmax ] [-bg <bg_file>]
 
-Version History
+Arguments
+-i, –input           Space-separated list of input data files (required).
+-hl, –header_lines   Number of header lines to skip (default: 0).
+-u, –units           q units: A (Å⁻¹) or nm (nm⁻¹). Default: A.
+-f, –factor          Intensity normalization factor (default: 1.0).
+-qmin, -qmax          q-window for analysis. If either is omitted, SASFOX asks you to click two points to set them.
+-bg, –background     Optional background file (same format as inputs). If given, background is subtracted after mapping to the closest q (5% tolerance on |Δq|/q).
 
-v1.0 (2025-08-13)
-	•	Initial stable release with config-driven execution.
-	•	Added batch mode for multiple input files.
-	•	Unified plotting style and export routines.
-	•	Standardized logging format.
+Input format
+• Plain text, whitespace-delimited, two numeric columns:
+col 0 = q, col 1 = I(q).
+• Use -hl if your files contain headers.
+• If using a background, its q-grid should closely match data; otherwise subtraction aborts when |q_data – q_bg| / q_data > 5%.
 
-Usage
-	1.	Requirements
-Python 3.x with:
-pip install numpy matplotlib scipy configparser argparse
-	2.	Prepare the Input File
-All parameters are set in config.ini.
+Outputs (created in a new folder named YYYYMMDD_SAXSanalysis_N)
+	1.	Per-file plots
+• _OZ.png — data and OZ fit over [qmin, qmax]
+• _DB.png — data and DB fit over [qmin, qmax]
+• _OZ_residuals.png — OZ residuals (log x; linear y fixed to ±1×10⁻³)
+	2.	Residual tables (tab-separated; columns: q, I_obs, I_fit, residual, std_residual[NaN])
+• _OZ_residuals.tsv
+• _DB_residuals.tsv
+• _Guinier_residuals.tsv  (note: despite the name, this records power-law residuals over your user-selected range)
+	3.	Master results table
+• results.txt (tab-separated; one row per input). Columns include:
+– Invariant Q, Integrated intensity J, “No-model” ξ_int = J/Q
+– OZ fit: ξ (reported as “OZ Correlation Length”), I₀, standard errors, and metrics (n, k, dof, RSS, TSS, R², R²_adj, RMSE, χ²_red, AIC, BIC)
+– DB fit: ξ (reported as “DB Correlation Length”), I₀, standard errors, and the same metrics
+– Interactive range estimates: power-law slope and Rg
+– If the interactive fit computed metrics, their n, k, dof, RSS, TSS, R², R²_adj, RMSE, χ²_red, AIC, BIC are appended
+	4.	Run directory
+• analysis folder with all files above; naming auto-increments to avoid overwriting.
 
-Main sections in config.ini:
-	•	[INPUT]
-	•	input_files — space-separated list of SAXS/SANS data files to process.
-	•	header_lines — number of header lines to skip in each data file.
-	•	units — A for Å⁻¹, nm for nm⁻¹.
-	•	normalization_factor — scalar multiplier for intensities.
-	•	qmin, qmax — cropping limits in q.
-	•	background_file — optional background scattering file for subtraction.
-	•	[FITTING]
-	•	model — fitting model to apply (e.g., guinier, porod, powerlaw).
-	•	initial_parameters — starting guesses for fitting parameters.
-	•	[PLOTTING]
-	•	plot_title — custom title for plots.
-	•	save_plots — yes or no.
-	•	output_directory — where plots and processed data will be saved.
+Typical workflows
+• Fully interactive q-window (no background):
+python SASFOX.py -i sample1.txt sample2.txt -hl 1 -u A -f 1.0
+(Click two points to set qmin and qmax; repeat range selection when prompted for the power-law/Guinier step.)
+• With background and explicit q-window:
+python SASFOX.py -i data/*.dat -u nm -bg background.dat -qmin 0.1 -qmax 4.0
 
-	3.	Running the Program
-From the terminal:
-python SASFOX.py path/to/config.ini
+Notes & assumptions
+• Units: Internally q is treated in nm⁻¹. If you pass Å⁻¹ (-u A), SASFOX multiplies q by 10. Correlation lengths (ξ, Rg) are therefore in nm.
+• Background subtraction: nearest-neighbor mapping in q with |Δq|/q ≤ 0.05; outside this tolerance, the run stops with an error.
+• Metrics: χ²_red is reported but not modeled with experimental σ; in this build it remains NaN unless you extend the code.
+• “Guinier_residuals.tsv” file name is historical; it actually logs residuals for the power-law fit over your selected range.
+• Input files are read with pandas.read_csv(…, delim_whitespace=True, usecols=[0,1], header=None). Ensure the first two columns are q and I.
+• Plots use log–log axes for data/fit; OZ residuals PNG is produced, DB residuals PNG is not (TSV only).
+• All integrals and fits are restricted to [qmin, qmax] after optional background subtraction.
 
-Outputs
-	•	Data files: processed intensity data, fitted parameters, residuals.
-	•	Plots:
-	•	Experimental data with fit overlay.
-	•	Residuals (data − fit).
-	•	Log file: records all steps and any warnings or errors.
+Requirements
+Python 3.x with: numpy, pandas, scipy, matplotlib.
+Install example:
+pip install numpy pandas scipy matplotlib
 
-Notes
-	•	Ensure all file paths in config.ini are valid and accessible.
-	•	Units of q and intensities must be consistent.
-	•	Fitting convergence depends strongly on initial parameter guesses — adjust them if fits are poor.
+Contact
+Issues or feature requests: please include your command line, a small input example, and the produced results.txt.
+alessandro1.mariani@polimi.it
